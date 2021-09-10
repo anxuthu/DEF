@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 
+__all__ = ['RankKReducer']
+
 class Reducer:
     def __init__(self, random_seed, device):
         self.rng = np.random.RandomState(random_seed)
@@ -124,7 +126,7 @@ class RankKReducer(Reducer):
         for p, q, (tensor, _, mem) in zip(ps, qs, high_rank_tensors):
             matrix = tensor.view(tensor.shape[0], -1)
             torch.matmul(matrix.t(), p, out=q)
-            mem.data[:] = tensor - torch.matmul(p, q.t()).view_as(tensor)
+            mem.data[:] = tensor - torch.matmul(p, q.t()).view_as(tensor) # 1
 
         ##### reduce.q #####
         all_reduce(self.q_memory)
@@ -134,140 +136,9 @@ class RankKReducer(Reducer):
         ##### reduce.outerprod #####
         for p, q, (tensor, out, mem) in zip(ps, qs, high_rank_tensors):
             # Set the output gradient
-            torch.matmul(p, q.t(), out=out.data[:])
-            #mem.data[:] = tensor - out
-
-        ##### reduce.rank1.unpack #####
-        rank1_handle.wait()
-        rank1_tensor_list.buffer /= self.n_workers
-        rank1_tensor_list.unpack([out for (_, out, _) in rank1_tensors])
-
-        return bits_communicated
-
-
-class RankKReducer2(Reducer):
-    def __init__(self, random_seed, device, reuse_query=False, rank=1):
-        super().__init__(random_seed, device)
-        self.rank = rank
-        self.p_memory = None
-        self.q_memory = None
-        self.reuse_query = reuse_query
-
-    def set_random(self, vector):
-        torch.manual_seed(self.rng.randint(1_000_000_000))
-        vector.data[:] = torch.randn(*vector.shape, device=self.device)
-        # orthogonalize(vector)
-
-    def reduce(self, grad_in, grad_out, memory_out):
-        """
-        Reduce gradients between the workers in place
-        :param grad_in: dictionary
-        :param grad_out: dictionary
-        :param memory_out: dictionary
-        """
-        bits_communicated = 0
-
-        # Split the tensors into rank1-ones that will be reduced un-compressed
-        # and rank > 1 tensors that are compressed
-        rank1_tensors = [
-            (tensor, out, mem)
-            for tensor, out, mem in zip(grad_in, grad_out, memory_out)
-            if tensor.ndimension() <= 1
-        ]
-        high_rank_tensors = [
-            (tensor, out, mem)
-            for tensor, out, mem in zip(grad_in, grad_out, memory_out)
-            if tensor.ndimension() > 1
-        ]
-
-        # We are building a rank-1 approximation of every tensor
-        # that can be interpreted as a matrix. Let the approximation be
-        # M = p q^T
-        # We are allocating consequtive memory for the p's and q's
-
-        memory_is_uninitialized = self.p_memory is None
-
-        ##### reduce.allocate_memory #####
-        p_total_size = 0
-        q_total_size = 0
-        for tensor, _, _ in high_rank_tensors:
-            matrix = tensor.view(tensor.shape[0], -1)
-            n, m = matrix.shape
-            rank = min(n, m, self.rank)
-            p_total_size += n * rank
-            q_total_size += m * rank
-        if self.p_memory is None:
-            self.p_memory = torch.empty(p_total_size, device=self.device)
-            self.q_memory = torch.empty(q_total_size, device=self.device)
-
-        # Find them again and make lists of pointers
-        ps = []
-        qs = []
-        p_idx = 0
-        q_idx = 0
-        for tensor, _, _ in high_rank_tensors:
-            matrix = tensor.view(tensor.shape[0], -1)
-            n, m = matrix.shape
-            rank = min(n, m, self.rank)
-            ps.append(self.p_memory[p_idx : p_idx + n * rank].view(n, rank))
-            qs.append(self.q_memory[q_idx : q_idx + m * rank].view(m, rank))
-            p_idx += n * rank
-            q_idx += m * rank
-
-        ##### reduce.prepare.q #####
-        for (tensor, _, _), q, p in zip(high_rank_tensors, qs, ps):
-            matrix = tensor.view(tensor.shape[0], -1)
-            n, m = matrix.shape
-
-            if self.reuse_query and not memory_is_uninitialized:
-                # orthogonalize(q)
-                pass
-            else:
-                # Sample a query vector q
-                self.set_random(q)
-
-        ##### reduce.compute.p #####
-        for (tensor, _, _), q, p in zip(high_rank_tensors, qs, ps):
-            matrix = tensor.view(tensor.shape[0], -1)
-            torch.matmul(matrix, q, out=p)
-
-        ##### reduce.p #####
-        all_reduce(self.p_memory)
-        bits_communicated += n_bits(self.p_memory)
-
-        # Start communicating rank 1 tensors
-        rank1_tensor_list = TensorBuffer([tensor for (tensor, _, _) in rank1_tensors])
-        rank1_handle = rank1_tensor_list.all_reduce(async_op=True)
-        bits_communicated += rank1_tensor_list.bits()
-
-        ##### reduce.normalize.p #####
-        for p in ps:
-            orthogonalize(p)
-
-        ##### reduce.compute.q #####
-        for p, q, (tensor, _, mem) in zip(ps, qs, high_rank_tensors):
-            matrix = tensor.view(tensor.shape[0], -1)
-            torch.matmul(matrix.t(), p, out=q)
-            mem.data[:] = tensor - torch.matmul(p, q.t()).view_as(tensor) # error
-
-        ##### reduce.q #####
-        all_reduce(self.q_memory)
-        bits_communicated += n_bits(self.q_memory)
-        self.q_memory.data[:] /= self.n_workers
-
-        ##### reduce.outerprod #####
-        for p, q, (tensor, out, mem) in zip(ps, qs, high_rank_tensors):
-            # Partially sync error
-            matrix = tensor.view(tensor.shape[0], -1)
-            c_tensor = torch.matmul(p, torch.matmul(matrix.t(), p).t())
-            c2_tensor = torch.matmul(p, torch.matmul(c_tensor.t(), p).t())
-            c_avg_tensor = torch.matmul(p, q.t())
-            c2_avg_tensor = torch.matmul(p, torch.matmul(c_avg_tensor.t(), p).t())
-            error = matrix - 2 * c_tensor + c2_tensor + c_avg_tensor - c2_avg_tensor
-            mem.copy_(error.view_as(tensor))
-
-            # Set the output gradient
-            torch.matmul(p, q.t(), out=out.data[:])
+            output = torch.matmul(p, q.t()).view_as(tensor)
+            #mem.data[:] = tensor - output # 2
+            out.data[:] = output
 
         ##### reduce.rank1.unpack #####
         rank1_handle.wait()

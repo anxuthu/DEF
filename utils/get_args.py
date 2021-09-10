@@ -19,7 +19,7 @@ def GetArgs():
     parser.add_argument('--dist-backend', default='NCCL', type=str, help='dist backend')
 
     ### optimizer hyperparameters ###
-    parser.add_argument('-o', '--optim', default='DistSGD', type=str)
+    parser.add_argument('-o', '--optim', default='SGD', type=str)
     parser.add_argument('-wd', '--weight-decay', default=5e-4, type=float)
     parser.add_argument('-m', '--momentum', default=0.9, type=float)
     parser.add_argument('-p', '--period', default=1, type=int, help='local steps')
@@ -33,5 +33,7 @@ def GetArgs():
 
     ### PowerSGD ###
     parser.add_argument('--prank', default=1, type=int, help='powersgd rank')
+    parser.add_argument('-rq', '--reuse-query', action='store_true')
+    parser.add_argument('--coeff', default=1, type=float)
 
     return parser.parse_args()

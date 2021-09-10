@@ -1,3 +1,6 @@
-from .dist_sgd import DistSGD
-from .ef_sgd import EFSGD
-from .saef_sgd import SAEFSGD
+from .sgd import SGD
+from .ef import EF
+from .pef import PEF
+from .saef import SAEF
+
+from .new import New

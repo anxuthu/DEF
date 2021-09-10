@@ -15,6 +15,7 @@ import torch.utils.data
 import torch.utils.data.distributed
 
 import optimizers
+import all_reducer
 from utils import *
 
 
@@ -70,7 +71,8 @@ def main_worker(gpu, ngpus_per_node, args):
     #args.batch_size = int(args.batch_size / args.world_size)
     train_dataset, val_dataset = GetDataset(args.dataset, args.path)
     train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=True, seed=args.seed)
+        train_dataset, num_replicas=args.world_size, rank=args.rank, shuffle=True,
+        seed=args.seed)
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
@@ -81,10 +83,13 @@ def main_worker(gpu, ngpus_per_node, args):
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
+    reducer = all_reducer.RankKReducer(random_seed=args.seed, device=args.gpu,
+                                       reuse_query=args.reuse_query, rank=args.prank)
+
     optimizer = optimizers.__dict__[args.optim](
         model.parameters(), lr=args.lr, momentum=args.momentum,
         weight_decay=args.weight_decay, period=args.period, period2=args.period2,
-        seed=args.seed, device=args.gpu, prank=args.prank)
+        reducer=reducer, coeff=args.coeff)
 
     # train and eval
     global best_acc1

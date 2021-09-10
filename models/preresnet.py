@@ -7,7 +7,7 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 import math
 
-__all__ = ['resnet20ng8', 'resnet56ng8']
+__all__ = ['resnet56', 'resnet110', 'resnet164']
 
 
 def conv3x3(in_planes, out_planes, stride=1):
@@ -18,12 +18,12 @@ def conv3x3(in_planes, out_planes, stride=1):
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None, num_groups=32):
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
         super(BasicBlock, self).__init__()
-        self.bn1 = nn.GroupNorm(num_groups, inplanes)
+        self.bn1 = nn.BatchNorm2d(inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.conv1 = conv3x3(inplanes, planes, stride)
-        self.bn2 = nn.GroupNorm(num_groups, planes)
+        self.bn2 = nn.BatchNorm2d(planes)
         self.conv2 = conv3x3(planes, planes)
         self.downsample = downsample
         self.stride = stride
@@ -50,14 +50,14 @@ class BasicBlock(nn.Module):
 class Bottleneck(nn.Module):
     expansion = 4
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None, num_groups=32):
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
         super(Bottleneck, self).__init__()
-        self.bn1 = nn.GroupNorm(num_groups, inplanes)
+        self.bn1 = nn.BatchNorm2d(inplanes)
         self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
-        self.bn2 = nn.GroupNorm(num_groups, planes)
+        self.bn2 = nn.BatchNorm2d(planes)
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
                                padding=1, bias=False)
-        self.bn3 = nn.GroupNorm(num_groups, planes)
+        self.bn3 = nn.BatchNorm2d(planes)
         self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False)
         self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
@@ -88,7 +88,7 @@ class Bottleneck(nn.Module):
 
 class PreResNet(nn.Module):
 
-    def __init__(self, num_classes=10, depth=110, num_groups=32):
+    def __init__(self, num_classes=10, depth=110):
         super(PreResNet, self).__init__()
         if depth >= 44:
             assert (depth - 2) % 9 == 0, 'depth should be 9n+2'
@@ -103,10 +103,10 @@ class PreResNet(nn.Module):
         self.inplanes = 16
         self.conv1 = nn.Conv2d(3, 16, kernel_size=3, padding=1,
                                bias=False)
-        self.layer1 = self._make_layer(block, 16, n, stride=1, num_groups=num_groups)
-        self.layer2 = self._make_layer(block, 32, n, stride=2, num_groups=num_groups)
-        self.layer3 = self._make_layer(block, 64, n, stride=2, num_groups=num_groups)
-        self.bn = nn.GroupNorm(num_groups, 64 * block.expansion)
+        self.layer1 = self._make_layer(block, 16, n)
+        self.layer2 = self._make_layer(block, 32, n, stride=2)
+        self.layer3 = self._make_layer(block, 64, n, stride=2)
+        self.bn = nn.BatchNorm2d(64 * block.expansion)
         self.relu = nn.ReLU(inplace=True)
         self.avgpool = nn.AvgPool2d(8)
         self.fc = nn.Linear(64 * block.expansion, num_classes)
@@ -115,11 +115,11 @@ class PreResNet(nn.Module):
             if isinstance(m, nn.Conv2d):
                 n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
                 m.weight.data.normal_(0, math.sqrt(2. / n))
-            elif isinstance(m, nn.GroupNorm):
+            elif isinstance(m, nn.BatchNorm2d):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
 
-    def _make_layer(self, block, planes, blocks, stride=1, num_groups=32):
+    def _make_layer(self, block, planes, blocks, stride=1):
         downsample = None
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
@@ -128,10 +128,10 @@ class PreResNet(nn.Module):
             )
 
         layers = list()
-        layers.append(block(self.inplanes, planes, stride, downsample, num_groups))
+        layers.append(block(self.inplanes, planes, stride, downsample))
         self.inplanes = planes * block.expansion
         for i in range(1, blocks):
-            layers.append(block(self.inplanes, planes, num_groups=num_groups))
+            layers.append(block(self.inplanes, planes))
 
         return nn.Sequential(*layers)
 
@@ -151,7 +151,11 @@ class PreResNet(nn.Module):
         return x
 
 
-def resnet56ng8(num_classes=10):
-    return PreResNet(num_classes=num_classes, depth=56, num_groups=8)
-def resnet20ng8(num_classes=10):
-    return PreResNet(num_classes=num_classes, depth=20, num_groups=8)
+def resnet56(num_classes=10):
+    return PreResNet(num_classes=num_classes, depth=56)
+
+def resnet110(num_classes=10):
+    return PreResNet(num_classes=num_classes, depth=110)
+
+def resnet164(num_classes=10):
+    return PreResNet(num_classes=num_classes, depth=164)
