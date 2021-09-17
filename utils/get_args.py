@@ -24,6 +24,7 @@ def GetArgs():
     parser.add_argument('-m', '--momentum', default=0.9, type=float)
     parser.add_argument('-p', '--period', default=1, type=int, help='local steps')
     parser.add_argument('-p2', '--period2', default=None, type=int, help='saef')
+    parser.add_argument('--coeff', default=1, type=float)
 
     ### learning rate ###
     parser.add_argument('--lr', default=0.05, type=float)
@@ -31,9 +32,10 @@ def GetArgs():
     parser.add_argument('-ls', '--lr-schedule', default='cos', type=str, choices=['const', 'cos'])
     parser.add_argument('-ds', '--decay-schedule', type=float, nargs='+', default=[0.5, 0.75], help='lr decaying epochs')
 
-    ### PowerSGD ###
-    parser.add_argument('--prank', default=1, type=int, help='powersgd rank')
+    ### compression ###
+    parser.add_argument('--reducer', default='RankK', choices=['RankK', 'URSB', 'TopK'])
+    parser.add_argument('--prank', default=1, type=int, help='PowerSGD rank')
     parser.add_argument('-rq', '--reuse-query', action='store_true')
-    parser.add_argument('--coeff', default=1, type=float)
+    parser.add_argument('--ratio', default=1, type=float, help='URSB')
 
     return parser.parse_args()
