@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-__all__ = ['RankKReducer']
+__all__ = ['RankK', 'URSB', 'TopK']
 
 class Reducer:
     def __init__(self, random_seed, device):
@@ -23,8 +23,130 @@ class Reducer:
         raise NotImplementedError()
 
 
-class RankKReducer(Reducer):
-    def __init__(self, random_seed, device, reuse_query=False, rank=1):
+class TopK(Reducer):
+    """
+    Use same amount as rank-based
+    """
+    def __init__(self, random_seed, device, compression=1 / 244, **kwargs):
+        super().__init__(random_seed, device)
+        self.compression = compression
+
+    def reduce(self, grad_in, grad_out, memory_out):
+        """
+        Reduce gradients between the workers in place
+        :param grad_in: dictionary
+        :param grad_out: dictionary
+        :param memory_out: dictionary
+        """
+        bits_communicated = 0
+
+        # Find the size of a flatpacked gradient
+        flatgrad_size = 0
+        tensor_idx = [0]
+        for tensor in grad_in:
+            top_size = max(1, int(0.5 * self.compression * tensor.nelement()))
+            flatgrad_size += top_size
+            tensor_idx.append(tensor_idx[-1] + top_size)
+        flatgrad_start_idx = tensor_idx[:-1]
+        flatgrad_end_idx = tensor_idx[1:]
+        flat_values = torch.empty(flatgrad_size, device=self.device)
+        flat_positions = torch.empty(flatgrad_size, device=self.device, dtype=torch.int)
+
+        for tensor, start, end in zip(grad_in, flatgrad_start_idx, flatgrad_end_idx):
+            top_size = max(1, int(0.5 * self.compression * tensor.nelement()))
+            _, positions = torch.topk(tensor.view(-1).abs(), top_size, sorted=False)
+            values = tensor.view(-1)[positions].contiguous()
+            flat_values[start:end] = values
+            flat_positions[start:end] = positions
+
+        for tensor, mem, start, end in zip(
+            grad_in, memory_out, flatgrad_start_idx, flatgrad_end_idx
+        ):
+            positions = flat_positions[start:end]
+            mem.data[:] = tensor
+            mem.view(-1)[positions.long()] = 0.0
+
+        if self.n_workers > 1:
+            worker_values = [torch.empty_like(flat_values) for i in range(self.n_workers)]
+            worker_positions = [torch.empty_like(flat_positions) for i in range(self.n_workers)]
+            h1 = all_gather(worker_values, flat_values, async_op=True)
+            h2 = all_gather(worker_positions, flat_positions, async_op=True)
+            h1.wait()
+            h2.wait()
+        else:
+            worker_values = [flat_values]
+            worker_positions = [flat_positions]
+        bits_communicated += n_bits(flat_values) + n_bits(flat_positions)
+
+        for tensor, out, start, end in zip(
+            grad_in, grad_out, flatgrad_start_idx, flatgrad_end_idx
+        ):
+            out.data[:] = 0
+            for pos, val in zip(worker_positions, worker_values):
+                positions = pos[start:end]
+                values = val[start:end]
+                # out.view(-1)[pos].add_(1.0 / self.n_workers, val)
+                out.view(-1)[positions.long()] += values / self.n_workers
+
+
+#class UniformRandomSparseBlockReducer(Reducer):
+class URSB(Reducer):
+    def __init__(self, random_seed, device, compression=1 / 244, **kwargs):
+        super().__init__(random_seed, device)
+        self.compression = compression
+
+    def reduce(self, grad_in, grad_out, memory_out):
+        """
+        Reduce gradients between the workers in place
+        :param grad_in: dictionary
+        :param grad_out: dictionary
+        :param memory_out: dictionary
+        """
+        bits_communicated = 0
+
+        values_list = []
+        start_idx_list = []
+        block_sizes = []
+
+        for tensor in grad_in:
+            block_size = max(1, int(self.compression * tensor.nelement()))
+            block_sizes.append(block_size)
+            start_idx = self.rng.choice(tensor.nelement())
+            start_idx_list.append(start_idx)
+            end_idx = min(start_idx + block_size, tensor.nelement())
+            bfr = torch.empty(block_size, dtype=torch.float32, device=self.device)
+            bfr[: end_idx - start_idx] = tensor.view(-1)[start_idx:end_idx]
+            rest = block_size - (end_idx - start_idx)
+            if rest > 0:
+                bfr[end_idx - start_idx :] = tensor.view(-1)[:rest]
+            values_list.append(bfr)
+
+        flat_values = TensorBuffer(values_list)
+
+        for tensor, mem, start_idx, block_size in zip(grad_in, memory_out, start_idx_list, block_sizes):
+            end_idx = min(start_idx + block_size, tensor.nelement())
+            rest = block_size - (end_idx - start_idx)
+            #mem.data = tensor.clone()
+            mem.data.copy_(tensor)
+            mem.view(-1)[start_idx:end_idx] = 0.0
+            if rest > 0:
+                mem.view(-1)[:rest] = 0.0
+
+        flat_values.all_reduce()
+        flat_values.buffer /= self.n_workers
+        bits_communicated += flat_values.bits()
+
+        for tensor, out, start_idx, block_size, values in zip(grad_in, grad_out, start_idx_list, block_sizes, flat_values):
+            end_idx = min(start_idx + block_size, tensor.nelement())
+            rest = block_size - (end_idx - start_idx)
+            out.data.zero_()
+            out.view(-1)[start_idx:end_idx] = values[: end_idx - start_idx]
+            if rest > 0:
+                out.view(-1)[:rest] = values[end_idx - start_idx :]
+
+
+class RankK(Reducer):
+    def __init__(self, random_seed, device, reuse_query=False, rank=1, **kwargs):
         super().__init__(random_seed, device)
         self.rank = rank
         self.p_memory = None
@@ -145,7 +267,9 @@ class RankKReducer(Reducer):
         rank1_tensor_list.buffer /= self.n_workers
         rank1_tensor_list.unpack([out for (_, out, _) in rank1_tensors])
 
-        return bits_communicated
+        #fp_bits = n_bits(torch.cat([tensor.view(-1) for tensor in grad_in]))
+        #print(fp_bits / bits_communicated)
+        #import sys; sys.exit()
 
 
 @torch.jit.script
@@ -220,6 +344,14 @@ class TensorBuffer():
             return buffers, handle
         else:
             return buffers
+
+
+def all_gather(out_list, in_tensor, **kwargs):
+    if torch.distributed.is_available() and torch.distributed.get_world_size() > 1:
+        return torch.distributed.all_gather(out_list, in_tensor, **kwargs)
+    else:
+        assert len(out_list) == 1
+        out_list[0].data = in_tensor
 
 
 def all_reduce(*args, **kwargs):
