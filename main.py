@@ -83,16 +83,19 @@ def main_worker(gpu, ngpus_per_node, args):
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
-    reducer = all_reducer.__dict__[args.reducer](
+    reducer = all_reducer.RankK(
         random_seed=args.seed, device=args.gpu,
         reuse_query=args.reuse_query, rank=args.prank, #RankK
+    )
+    reducer2 = all_reducer.URSB(
+        random_seed=args.seed, device=args.gpu,
         compression=1.0 / args.ratio, #URSB
     )
 
     optimizer = optimizers.__dict__[args.optim](
         model.parameters(), lr=args.lr, momentum=args.momentum,
         weight_decay=args.weight_decay, period=args.period, period2=args.period2,
-        reducer=reducer, coeff=args.coeff)
+        reducer=reducer, reducer2=reducer2, coeff=args.coeff)
 
     # train and eval
     global best_acc1

@@ -33,7 +33,7 @@ def GetArgs():
     parser.add_argument('-ds', '--decay-schedule', type=float, nargs='+', default=[0.5, 0.75], help='lr decaying epochs')
 
     ### compression ###
-    parser.add_argument('--reducer', default='RankK', choices=['RankK', 'URSB', 'TopK'])
+    #parser.add_argument('--reducer', default='RankK', choices=['RankK', 'URSB', 'TopK'])
     parser.add_argument('--prank', default=1, type=int, help='PowerSGD rank')
     parser.add_argument('-rq', '--reuse-query', action='store_true')
     parser.add_argument('--ratio', default=1, type=float, help='URSB')

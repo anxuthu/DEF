@@ -4,3 +4,4 @@ from .pef import PEF
 from .saef import SAEF
 
 from .new import New
+from .Def import DEF

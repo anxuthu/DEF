@@ -20,16 +20,17 @@ class PEF(Optimizer):
 
         self.reducer = reducer
         self.deltas = []
+        self.c_deltas = []
         self.errors = []
         for group in self.param_groups:
             for p in group['params']:
                 state = self.state[p]
                 state['delta'] = p.clone().detach().zero_()
+                state['c_delta'] = p.clone().detach().zero_()
                 state['error'] = p.clone().detach().zero_()
                 self.deltas.append(state['delta'])
+                self.c_deltas.append(state['c_delta'])
                 self.errors.append(state['error'])
-
-        self.last_lr = 1
 
     def __setstate__(self, state):
         super(PEF, self).__setstate__(state)
@@ -55,21 +56,9 @@ class PEF(Optimizer):
             for p in group['params']:
                 d_p = p.grad.data
                 state = self.state[p]
+                state['delta'].copy_(d_p * group['lr'] + state['error'])
 
-                """ pre-reduce """
-                #if weight_decay != 0:
-                #    d_p.add_(p.data, alpha=weight_decay)
-                #if momentum != 0:
-                #    if 'momentum_buffer' not in state:
-                #        buf = state['momentum_buffer'] = torch.clone(d_p).detach()
-                #    else:
-                #        buf = state['momentum_buffer']
-                #        buf.mul_(momentum).add_(d_p)
-                #    d_p = buf
-
-                state['delta'].copy_(d_p + self.last_lr / group['lr'] * state['error'])
-
-        c_bits = self.reducer.reduce(self.deltas, self.deltas, self.errors)
+        self.reducer.reduce(self.deltas, self.c_deltas, self.errors)
 
         for group in self.param_groups:
             weight_decay = group['weight_decay']
@@ -77,9 +66,8 @@ class PEF(Optimizer):
 
             for p in group['params']:
                 state = self.state[p]
-                delta = state['delta']
+                delta = state['c_delta'] / group['lr']
 
-                """ post-reduce """
                 if weight_decay != 0:
                     delta = delta.add(p.data, alpha=weight_decay)
                 if momentum != 0:
@@ -91,7 +79,5 @@ class PEF(Optimizer):
                     delta = buf
 
                 p.data.add_(delta, alpha=-group['lr'])
-
-        self.last_lr = self.param_groups[0]['lr']
 
         return loss

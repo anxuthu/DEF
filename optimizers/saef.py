@@ -23,17 +23,18 @@ class SAEF(Optimizer):
 
         self.reducer = reducer
         self.deltas = []
+        self.c_deltas = []
         self.errors = []
         for group in self.param_groups:
             for p in group['params']:
                 state = self.state[p]
                 state['old'] = p.clone().detach()
                 state['delta'] = p.clone().detach().zero_()
+                state['c_delta'] = p.clone().detach().zero_()
                 state['error'] = p.clone().detach().zero_()
                 self.deltas.append(state['delta'])
+                self.c_deltas.append(state['c_delta'])
                 self.errors.append(state['error'])
-
-        self.last_lr = 1
 
     def __setstate__(self, state):
         super(SAEF, self).__setstate__(state)
@@ -50,6 +51,8 @@ class SAEF(Optimizer):
         loss = None
         if closure is not None:
             loss = closure()
+
+        self.cur_step += 1
 
         # optimizer update
         for group in self.param_groups:
@@ -70,21 +73,16 @@ class SAEF(Optimizer):
                         buf.mul_(momentum).add_(d_p)
                     d_p = buf
 
-                state['delta'].copy_(d_p + self.last_lr / group['lr'] * state['error'])
+                state['delta'].copy_(d_p * group['lr'] + state['error'])
 
-        c_bits = self.reducer.reduce(self.deltas, self.deltas, self.errors)
+        self.reducer.reduce(self.deltas, self.c_deltas, self.errors)
 
         for group in self.param_groups:
             for p in group['params']:
                 state = self.state[p]
-                p.data.copy_(state['old']).add_(state['delta'], alpha=-group['lr'])
+                state['old'].add_(state['c_delta'], alpha=-1.0)
+                p.data.copy_(state['old']).add_(state['error'], alpha=-1.0)
 
-                state['old'].copy_(p.data)
-                p.data.add_(state['error'], alpha=-group['lr'])
-
-        self.last_lr = self.param_groups[0]['lr']
-
-        self.cur_step += 1
         if self.period2 and self.cur_step % self.period2 == 0:
             for error in self.errors:
                 dist.all_reduce(error)
