@@ -79,24 +79,18 @@ class DEF(Optimizer):
 
         for group in self.param_groups:
             weight_decay = group['weight_decay']
+            momentum = group['momentum']
 
             for p in group['params']:
                 state = self.state[p]
                 d_p = p.grad.data
                 if weight_decay != 0:
                     d_p.add_(p.data, alpha=weight_decay)
+                d_p = state['momentum_buffer'].mul_(momentum).add_(d_p)
                 p.data.add_(d_p, alpha=-group['lr'])
-                state['delta'].add_(d_p)
+                state['delta'].add_(d_p, alpha=group['lr'])
 
         if self.cur_step % self.period == 0:
-            for group in self.param_groups:
-                momentum = group['momentum']
-
-                for p in group['params']:
-                    state = self.state[p]
-                    buf = state['momentum_buffer'].mul_(momentum).add_(state['delta'])
-                    state['delta'].copy_(buf * group['lr'] + state['error'])
-
             self.reducer.reduce(self.deltas, self.c_deltas, self.errors)
 
             for group in self.param_groups:
@@ -104,7 +98,7 @@ class DEF(Optimizer):
                     state = self.state[p]
                     state['old'].add_(state['c_delta'], alpha=-1.0)
                     p.data.copy_(state['old']).add_(state['error'], alpha=-self.coeff)
-                    state['delta'].zero_()
+                    state['delta'].copy_(state['error'])
 
         if self.period2 and self.cur_step % self.period2 == 0:
             self.reducer2.reduce(self.errors, self.c_errors, self.e_errors)
