@@ -13,6 +13,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 import optimizers
 import all_reducer
@@ -83,13 +84,17 @@ def main_worker(gpu, ngpus_per_node, args):
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
-    reducer = all_reducer.RankK(
-        random_seed=args.seed, device=args.gpu,
-        reuse_query=args.reuse_query, rank=args.prank, #RankK
-    )
-    reducer2 = all_reducer.URSB(
+    #reducer = all_reducer.RankK(
+    #    random_seed=args.seed, device=args.gpu,
+    #    reuse_query=args.reuse_query, rank=args.prank, #RankK
+    #)
+    reducer = all_reducer.URSB(
         random_seed=args.seed, device=args.gpu,
         compression=1.0 / args.ratio, #URSB
+    )
+    reducer2 = all_reducer.URSB(#TODO
+        random_seed=args.seed, device=args.gpu,
+        compression=1.0 / args.ratio2, #URSB
     )
 
     optimizer = optimizers.__dict__[args.optim](
@@ -148,14 +153,20 @@ def train_eval(train_loader, val_loader, model, criterion, optimizer, epoch, arg
         # compute gradient and update parameters
         loss.backward()
         optimizer.step()
+
+        if (cur_step + 1) % args.period == 0:
+            #for p in model.buffers():
+            #    if len(p.shape) > 0:
+            #        dist.all_reduce(p)
+            #        p.div_(args.world_size)
+            vec = parameters_to_vector(model.buffers())
+            dist.all_reduce(vec)
+            vec.div_(dist.get_world_size())
+            vector_to_parameters(vec, model.buffers())
+
         epoch_time.update((time.time() - end)*len(train_loader))
 
         if (cur_step + 1) % args.period == 0:
-            for p in model.buffers():
-                if len(p.shape) > 0:
-                    dist.all_reduce(p)
-                    p.div_(args.world_size)
-
             if val_loader and batch_idx + args.period >= len(train_loader):
                 try:
                     optimizer.swap()

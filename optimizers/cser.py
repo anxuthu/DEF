@@ -4,10 +4,10 @@ import torch.distributed as dist
 import numpy as np
 
 
-class DEF(Optimizer):
+class CSER(Optimizer):
 
     def __init__(self, params, lr=required, momentum=0, weight_decay=0,
-                 reducer=required, reducer2=required, coeff=0, period=1,
+                 reducer=required, reducer2=required, period2=0,
                  **kwargs):
         if lr is not required and lr < 0.0:
             raise ValueError("Invalid learning rate: {}".format(lr))
@@ -17,12 +17,16 @@ class DEF(Optimizer):
             raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
 
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay)
-        super(DEF, self).__init__(params, defaults)
+        super(CSER, self).__init__(params, defaults)
 
         self.reducer = reducer
         self.deltas = []
         self.c_deltas = []
+        self.r_deltas = []
+        self.reducer2 = reducer2
         self.errors = []
+        self.c_errors = []
+        self.r_errors = []
 
         for group in self.param_groups:
             for p in group['params']:
@@ -31,19 +35,25 @@ class DEF(Optimizer):
 
                 state['delta'] = p.clone().detach().zero_()
                 state['c_delta'] = p.clone().detach().zero_()
-                state['error'] = p.clone().detach().zero_()
+                state['r_delta'] = p.clone().detach().zero_()
                 self.deltas.append(state['delta'])
                 self.c_deltas.append(state['c_delta'])
+                self.r_deltas.append(state['r_delta'])
+
+                state['error'] = p.clone().detach().zero_()
+                state['c_error'] = p.clone().detach().zero_()
+                state['r_error'] = p.clone().detach().zero_()
                 self.errors.append(state['error'])
+                self.c_errors.append(state['c_error'])
+                self.r_errors.append(state['r_error'])
 
                 state['momentum_buffer'] = p.clone().detach().zero_()
 
-        self.coeff = coeff
-        self.period = period
+        self.period2 = period2
         self.cur_step = 0
 
     def __setstate__(self, state):
-        super(DEF, self).__setstate__(state)
+        super(CSER, self).__setstate__(state)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -70,38 +80,25 @@ class DEF(Optimizer):
                 if weight_decay != 0:
                     d_p.add_(p.data, alpha=weight_decay)
                 d_p = state['momentum_buffer'].mul_(momentum).add_(d_p)
-                p.data.add_(d_p, alpha=-group['lr'])
-                state['delta'].add_(d_p, alpha=group['lr'])
+                state['delta'].copy_(d_p * group['lr'])
 
-        if self.cur_step % self.period == 0:
-            self.reducer.reduce(self.deltas, self.c_deltas, self.errors)
+        self.reducer.reduce(self.deltas, self.c_deltas, self.r_deltas)
+
+        for group in self.param_groups:
+            for p in group['params']:
+                state = self.state[p]
+                delta = state['c_delta'] + state['r_delta']
+                p.data.add_(delta, alpha=-1.0)
+                state['error'].add_(state['r_delta'], alpha=-1.0)
+
+        if self.period2 and self.cur_step % self.period2 == 0:
+            self.reducer2.reduce(self.errors, self.c_errors, self.r_errors)
 
             for group in self.param_groups:
                 for p in group['params']:
                     state = self.state[p]
-
-                    state['old'].add_(state['c_delta'], alpha=-1.0)
-                    p.data.copy_(state['old']).add_(state['error'], alpha=-self.coeff)
-                    state['delta'].copy_(state['error'])
+                    error = state['c_error'] + state['r_error']
+                    p.data.sub_(state['error']).add_(error)
+                    state['error'].copy_(state['r_error'])
 
         return loss
-
-    @torch.no_grad()
-    def swap(self): # only at evaluation
-        for group in self.param_groups:
-            for p in group['params']:
-                state = self.state[p]
-
-                if not 'flag' in state:
-                    state['flag'] = True
-                else:
-                    state['flag'] = not state['flag']
-
-                if state['flag']:
-                    error = state['error'].clone()
-                    dist.all_reduce(error)
-                    error.div_(dist.get_world_size())
-                    state['tmp'] = p.data.clone()
-                    p.data.copy_(state['old'] - error)
-                else:
-                    p.data.copy_(state['tmp'])
