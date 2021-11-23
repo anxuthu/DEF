@@ -1,7 +1,8 @@
 import numpy as np
 import torch
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
-__all__ = ['RankK', 'URSB', 'TopK']
+__all__ = ['URSB', 'GRSB']
 
 class Reducer:
     def __init__(self, random_seed, device):
@@ -23,72 +24,6 @@ class Reducer:
         raise NotImplementedError()
 
 
-class TopK(Reducer):
-    """
-    Use same amount as rank-based
-    """
-    def __init__(self, random_seed, device, compression=1 / 244, **kwargs):
-        super().__init__(random_seed, device)
-        self.compression = compression
-
-    def reduce(self, grad_in, grad_out, memory_out):
-        """
-        Reduce gradients between the workers in place
-        :param grad_in: dictionary
-        :param grad_out: dictionary
-        :param memory_out: dictionary
-        """
-        bits_communicated = 0
-
-        # Find the size of a flatpacked gradient
-        flatgrad_size = 0
-        tensor_idx = [0]
-        for tensor in grad_in:
-            top_size = max(1, int(0.5 * self.compression * tensor.nelement()))
-            flatgrad_size += top_size
-            tensor_idx.append(tensor_idx[-1] + top_size)
-        flatgrad_start_idx = tensor_idx[:-1]
-        flatgrad_end_idx = tensor_idx[1:]
-        flat_values = torch.empty(flatgrad_size, device=self.device)
-        flat_positions = torch.empty(flatgrad_size, device=self.device, dtype=torch.int)
-
-        for tensor, start, end in zip(grad_in, flatgrad_start_idx, flatgrad_end_idx):
-            top_size = max(1, int(0.5 * self.compression * tensor.nelement()))
-            _, positions = torch.topk(tensor.view(-1).abs(), top_size, sorted=False)
-            values = tensor.view(-1)[positions].contiguous()
-            flat_values[start:end] = values
-            flat_positions[start:end] = positions
-
-        for tensor, mem, start, end in zip(
-            grad_in, memory_out, flatgrad_start_idx, flatgrad_end_idx
-        ):
-            positions = flat_positions[start:end]
-            mem.data[:] = tensor
-            mem.view(-1)[positions.long()] = 0.0
-
-        if self.n_workers > 1:
-            worker_values = [torch.empty_like(flat_values) for i in range(self.n_workers)]
-            worker_positions = [torch.empty_like(flat_positions) for i in range(self.n_workers)]
-            h1 = all_gather(worker_values, flat_values, async_op=True)
-            h2 = all_gather(worker_positions, flat_positions, async_op=True)
-            h1.wait()
-            h2.wait()
-        else:
-            worker_values = [flat_values]
-            worker_positions = [flat_positions]
-        bits_communicated += n_bits(flat_values) + n_bits(flat_positions)
-
-        for tensor, out, start, end in zip(
-            grad_in, grad_out, flatgrad_start_idx, flatgrad_end_idx
-        ):
-            out.data[:] = 0
-            for pos, val in zip(worker_positions, worker_values):
-                positions = pos[start:end]
-                values = val[start:end]
-                # out.view(-1)[pos].add_(1.0 / self.n_workers, val)
-                out.view(-1)[positions.long()] += values / self.n_workers
-
-
 #class UniformRandomSparseBlockReducer(Reducer):
 class URSB(Reducer):
     def __init__(self, random_seed, device, compression=1 / 244, **kwargs):
@@ -96,6 +31,11 @@ class URSB(Reducer):
         self.compression = compression
 
     def reduce(self, grad_in, grad_out, memory_out):
+        if self.compression == 0:
+            for t1, t2, mem in zip(grad_in, grad_out, memory_out):
+                t2.zero_()
+                mem.copy_(t1)
+            return
         """
         Reduce gradients between the workers in place
         :param grad_in: dictionary
@@ -145,20 +85,18 @@ class URSB(Reducer):
                 out.view(-1)[:rest] = values[end_idx - start_idx :]
 
 
-class RankK(Reducer):
-    def __init__(self, random_seed, device, reuse_query=False, rank=1, **kwargs):
+#class GlobalRandomSparseBlockReducer(Reducer):
+class GRSB(Reducer):
+    def __init__(self, random_seed, device, compression=1 / 244, **kwargs):
         super().__init__(random_seed, device)
-        self.rank = rank
-        self.p_memory = None
-        self.q_memory = None
-        self.reuse_query = reuse_query
-
-    def set_random(self, vector):
-        torch.manual_seed(self.rng.randint(1_000_000_000))
-        vector.data[:] = torch.randn(*vector.shape, device=self.device)
-        # orthogonalize(vector)
+        self.compression = compression
 
     def reduce(self, grad_in, grad_out, memory_out):
+        if self.compression == 0:
+            for t1, t2, mem in zip(grad_in, grad_out, memory_out):
+                t2.zero_()
+                mem.copy_(t1)
+            return
         """
         Reduce gradients between the workers in place
         :param grad_in: dictionary
@@ -167,123 +105,98 @@ class RankK(Reducer):
         """
         bits_communicated = 0
 
-        # Split the tensors into rank1-ones that will be reduced un-compressed
-        # and rank > 1 tensors that are compressed
-        rank1_tensors = [
-            (tensor, out, mem)
-            for tensor, out, mem in zip(grad_in, grad_out, memory_out)
-            if tensor.ndimension() <= 1
-        ]
-        high_rank_tensors = [
-            (tensor, out, mem)
-            for tensor, out, mem in zip(grad_in, grad_out, memory_out)
-            if tensor.ndimension() > 1
-        ]
+        values_list = []
+        idx_list = []
 
-        # We are building a rank-1 approximation of every tensor
-        # that can be interpreted as a matrix. Let the approximation be
-        # M = p q^T
-        # We are allocating consequtive memory for the p's and q's
+        r = int(1 / self.compression)
+        r1 = 2 ** int(np.log2(r) / 2)
+        r2 = r // r1
 
-        memory_is_uninitialized = self.p_memory is None
+        for tensor, mem in zip(grad_in, memory_out):
+            if len(tensor.shape) > 1:
+                size1 = tensor.shape[0]
+                k1 = max(1, round(size1 / r1))
+                begin1 = self.rng.choice(int(np.ceil(size1 / k1))) * k1
+                end1 = min(begin1 + k1, size1)
 
-        ##### reduce.allocate_memory #####
-        p_total_size = 0
-        q_total_size = 0
-        for tensor, _, _ in high_rank_tensors:
-            matrix = tensor.view(tensor.shape[0], -1)
-            n, m = matrix.shape
-            rank = min(n, m, self.rank)
-            p_total_size += n * rank
-            q_total_size += m * rank
-        if self.p_memory is None:
-            self.p_memory = torch.empty(p_total_size, device=self.device)
-            self.q_memory = torch.empty(q_total_size, device=self.device)
+                size2 = tensor.shape[1]
+                k2 = max(1, round(size2 / r2))
+                begin2 = self.rng.choice(int(np.ceil(size2 / k2))) * k2
+                end2 = min(begin2 + k2, size2)
 
-        # Find them again and make lists of pointers
-        ps = []
-        qs = []
-        p_idx = 0
-        q_idx = 0
-        for tensor, _, _ in high_rank_tensors:
-            matrix = tensor.view(tensor.shape[0], -1)
-            n, m = matrix.shape
-            rank = min(n, m, self.rank)
-            ps.append(self.p_memory[p_idx : p_idx + n * rank].view(n, rank))
-            qs.append(self.q_memory[q_idx : q_idx + m * rank].view(m, rank))
-            p_idx += n * rank
-            q_idx += m * rank
+                value = tensor[begin1:end1, begin2:end2].reshape(-1)
+                values_list.append(value)
+                idx_list.append((begin1, end1, begin2, end2))
 
-        ##### reduce.prepare.q #####
-        for (tensor, _, _), q, p in zip(high_rank_tensors, qs, ps):
-            matrix = tensor.view(tensor.shape[0], -1)
-            n, m = matrix.shape
-
-            if self.reuse_query and not memory_is_uninitialized:
-                # orthogonalize(q)
-                pass
+                mem.copy_(tensor)
+                mem[begin1:end1, begin2:end2].zero_()
             else:
-                # Sample a query vector q
-                self.set_random(q)
+                size = tensor.shape[0]
+                k = max(1, round(size / r))
+                begin = self.rng.choice(int(np.ceil(size / k))) * k
+                end = min(begin + k, size)
 
-        ##### reduce.compute.p #####
-        for (tensor, _, _), q, p in zip(high_rank_tensors, qs, ps):
-            matrix = tensor.view(tensor.shape[0], -1)
-            torch.matmul(matrix, q, out=p)
+                value = tensor[begin:end]
+                values_list.append(value)
+                idx_list.append((begin, end))
 
-        ##### reduce.p #####
-        all_reduce(self.p_memory)
-        bits_communicated += n_bits(self.p_memory)
+                mem.copy_(tensor)
+                mem[begin:end].zero_()
 
-        # Start communicating rank 1 tensors
-        rank1_tensor_list = TensorBuffer([tensor for (tensor, _, _) in rank1_tensors])
-        rank1_handle = rank1_tensor_list.all_reduce(async_op=True)
-        bits_communicated += rank1_tensor_list.bits()
+        flat_values = TensorBuffer(values_list)
+        flat_values.all_reduce()
+        flat_values.buffer /= self.n_workers
+        bits_communicated += flat_values.bits()
 
-        ##### reduce.normalize.p #####
-        for p in ps:
-            orthogonalize(p)
+        for tensor, out, value, idx in zip(grad_in, grad_out, flat_values, idx_list):
+            if len(tensor.shape) > 1:
+                begin1, end1, begin2, end2 = idx
+                shape = tensor[begin1:end1, begin2:end2].shape
+                out.zero_()
+                out[begin1:end1, begin2:end2] = value.view(shape)
+            else:
+                begin, end = idx
+                out.zero_()
+                out[begin:end] = value
 
-        ##### reduce.compute.q #####
-        for p, q, (tensor, _, mem) in zip(ps, qs, high_rank_tensors):
-            matrix = tensor.view(tensor.shape[0], -1)
-            torch.matmul(matrix.t(), p, out=q)
-            mem.data[:] = tensor - torch.matmul(p, q.t()).view_as(tensor) # 1
-
-        ##### reduce.q #####
-        all_reduce(self.q_memory)
-        bits_communicated += n_bits(self.q_memory)
-        self.q_memory.data[:] /= self.n_workers
-
-        ##### reduce.outerprod #####
-        for p, q, (tensor, out, mem) in zip(ps, qs, high_rank_tensors):
-            # Set the output gradient
-            output = torch.matmul(p, q.t()).view_as(tensor)
-            #mem.data[:] = tensor - output # 2
-            out.data[:] = output
-
-        ##### reduce.rank1.unpack #####
-        rank1_handle.wait()
-        rank1_tensor_list.buffer /= self.n_workers
-        rank1_tensor_list.unpack([out for (_, out, _) in rank1_tensors])
-
-        #fp_bits = n_bits(torch.cat([tensor.view(-1) for tensor in grad_in]))
-        #print(fp_bits / bits_communicated)
-        #import sys; sys.exit()
-
-
-@torch.jit.script
-def orthogonalize(matrix):
-    n, m = matrix.shape
-    for i in range(m):
-        # Normalize the i'th column
-        col = matrix[:, i : i + 1]
-        col /= torch.sqrt(torch.sum(col ** 2))
-        # Project it on the rest and remove it
-        if i + 1 < m:
-            rest = matrix[:, i + 1 :]
-            # rest -= torch.matmul(col.t(), rest) * col
-            rest -= torch.sum(col * rest, dim=0) * col
+#class GRSB(Reducer):
+#    def __init__(self, random_seed, device, compression=1 / 244, **kwargs):
+#        super().__init__(random_seed, device)
+#        self.compression = compression
+#
+#    def reduce(self, grad_in, grad_out, memory_out):
+#        if self.compression == 0:
+#            for t1, t2, mem in zip(grad_in, grad_out, memory_out):
+#                t2.zero_()
+#                mem.copy_(t1)
+#            return
+#        """
+#        Reduce gradients between the workers in place
+#        :param grad_in: dictionary
+#        :param grad_out: dictionary
+#        :param memory_out: dictionary
+#        """
+#        grad_in_vec = parameters_to_vector(grad_in)
+#        num_p = grad_in_vec.numel()
+#
+#        total_blocks = 1024 #TODO
+#        block_size = int(np.ceil(num_p / total_blocks))
+#        vec = torch.zeros(total_blocks, block_size, device=self.device)
+#        vec.view(-1)[:num_p] = grad_in_vec
+#
+#        n_blocks = max(1, int(total_blocks * self.compression))
+#        block_idx = self.rng.choice(total_blocks, n_blocks, replace=False)
+#
+#        grad_out_vec = vec[block_idx, :].clone()
+#
+#        vec[block_idx, :] = 0
+#        vector_to_parameters(vec.view(-1)[:num_p], memory_out)
+#
+#        all_reduce(grad_out_vec)
+#        grad_out_vec /= self.n_workers
+#        vec = torch.zeros(total_blocks, block_size, device=self.device)
+#        vec[block_idx, :] = grad_out_vec
+#        vector_to_parameters(vec.view(-1)[:num_p], grad_out)
 
 
 def n_bits(tensor):

@@ -82,22 +82,22 @@ class CSER(Optimizer):
                 d_p = state['momentum_buffer'].mul_(momentum).add_(d_p)
                 state['delta'].copy_(d_p * group['lr'])
 
-        self.reducer.reduce(self.deltas, self.c_deltas, self.r_deltas)
+        self.reducer.reduce(self.deltas, self.c_deltas, self.r_deltas) # psync
 
         for group in self.param_groups:
             for p in group['params']:
                 state = self.state[p]
-                delta = state['c_delta'] + state['r_delta']
+                delta = state['c_delta'] + state['r_delta'] # psync
                 p.data.add_(delta, alpha=-1.0)
                 state['error'].add_(state['r_delta'], alpha=-1.0)
 
         if self.period2 and self.cur_step % self.period2 == 0:
-            self.reducer2.reduce(self.errors, self.c_errors, self.r_errors)
+            self.reducer2.reduce(self.errors, self.c_errors, self.r_errors) # psync
 
             for group in self.param_groups:
                 for p in group['params']:
                     state = self.state[p]
-                    error = state['c_error'] + state['r_error']
+                    error = state['c_error'] + state['r_error'] # psync
                     p.data.sub_(state['error']).add_(error)
                     state['error'].copy_(state['r_error'])
 

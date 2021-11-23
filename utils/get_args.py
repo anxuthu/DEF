@@ -36,7 +36,7 @@ def GetArgs():
     #parser.add_argument('--reducer', default='RankK', choices=['RankK', 'URSB', 'TopK'])
     #parser.add_argument('--prank', default=1, type=int, help='PowerSGD rank')
     #parser.add_argument('-rq', '--reuse-query', action='store_true')
-    parser.add_argument('--ratio', default=1, type=float, help='URSB')
-    parser.add_argument('--ratio2', default=1, type=float, help='URSB')
+    parser.add_argument('--ratio', default=1, type=float)
+    parser.add_argument('--ratio2', default=1, type=float)
 
     return parser.parse_args()

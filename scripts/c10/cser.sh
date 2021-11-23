@@ -1,12 +1,12 @@
 lr=5e-2
 b=16
-seed=2
+seed=0
 e=200
-ratio=64
-p2=0
-ratio2=1
-url="tcp://localhost:23452"
-devices="4,5"
+ratio=0
+p2=1
+ratio2=64
+url="tcp://localhost:23450"
+devices="0,1"
 
 file="vgg16bn-cser-lr${lr}b${b}-r${ratio}p${p2}r${ratio2}w8-${seed}"
 echo "$file" | tee $file

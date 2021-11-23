@@ -105,3 +105,12 @@ class DEF(Optimizer):
                     p.data.copy_(state['old'] - error)
                 else:
                     p.data.copy_(state['tmp'])
+
+    #@torch.no_grad()
+    #def swap(self):
+    #    for group in self.param_groups:
+    #        for p in group['params']:
+    #            state = self.state[p]
+    #            tmp = p.data.clone().detach()
+    #            p.data.copy_(state['old'])
+    #            state['old'].copy_(tmp)
