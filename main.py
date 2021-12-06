@@ -85,6 +85,7 @@ def main_worker(gpu, ngpus_per_node, args):
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
     compressor = all_reducer.URSB
+    #compressor = all_reducer.RankK
     c = 1.0 / args.ratio if args.ratio else 0
     reducer = compressor(random_seed=args.seed, device=args.gpu, compression=c)
     c = 1.0 / args.ratio2 if args.ratio2 else 0
