@@ -13,6 +13,7 @@ Codes for paper ["Detached Error Feedback for Distributed SGD with Random Sparsi
   series = 	 {Proceedings of Machine Learning Research},
   month = 	 {17--23 Jul},
   publisher =    {PMLR},
+}
 ```
 
 ### Run
